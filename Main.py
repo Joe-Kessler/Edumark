@@ -1,551 +1,597 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
 import os
+import sys
 import cv2
 import sqlite3
-import tkinter as tk
-from tkinter import messagebox, simpledialog, filedialog
-from tkinter import ttk
-from PIL import Image, ImageTk
-import csv
-from datetime import datetime
-import numpy as np
 import shutil
-import face_recognition  # Using face_recognition for robust detection
+import csv
+import numpy as np
+import face_recognition
+from datetime import datetime
 
-# ---------- Database Setup ----------
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QStackedWidget, QTabWidget, QLabel, QPushButton, QLineEdit,
+    QMessageBox, QFileDialog, QComboBox, QListWidget, QInputDialog,
+    QDialog, QFormLayout, QTableWidget, QTableWidgetItem, QGroupBox,
+    QHeaderView, QListWidgetItem
+)
+
 DB_NAME = "face_recognition.db"
-if not os.path.exists(DB_NAME):
+CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
+GLOBAL_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #2E3440;
+    color: #ECEFF4;
+    font-family: Helvetica;
+    font-size: 13px;
+}
+QTabWidget::pane { border: none; }
+QTabBar::tab {
+    background: #3B4252;
+    color: #ECEFF4;
+    padding: 10px 20px;
+    font-size: 14px;
+    min-width: 120px;
+    min-height: 40px;
+}
+QTabBar::tab:selected {
+    background: #88C0D0;
+    color: #2E3440;
+}
+QPushButton {
+    background-color: #88C0D0;
+    color: #2E3440;
+    border: none;
+    border-radius: 5px;
+    padding: 8px 16px;
+    font-weight: bold;
+    font-size: 14px;
+    min-height: 36px;
+}
+QPushButton:hover {
+    background-color: #81A1C1;
+}
+QLineEdit, QComboBox, QListWidget, QTableWidget {
+    background-color: #3B4252;
+    border: 1px solid #4C566A;
+    border-radius: 4px;
+    selection-background-color: #88C0D0;
+    selection-color: #2E3440;
+    font-size: 13px;
+}
+QHeaderView::section {
+    background-color: #3B4252;
+    padding: 6px;
+    border: 1px solid #4C566A;
+    font-size: 13px;
+}
+"""
+
+def update_schema():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('''CREATE TABLE admin (
+    cur.execute("PRAGMA table_info(time_slots)")
+    cols = [c[1] for c in cur.fetchall()]
+    if 'batch_id' not in cols:
+        cur.execute("ALTER TABLE time_slots ADD COLUMN batch_id INTEGER")
+        conn.commit()
+    conn.close()
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS admin (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     username TEXT UNIQUE NOT NULL,
                     password TEXT NOT NULL
                    )''')
-    cur.execute('''CREATE TABLE time_slots (
+    cur.execute('''CREATE TABLE IF NOT EXISTS batch (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     admin_id INTEGER,
+                    batch_name TEXT,
+                    UNIQUE(admin_id,batch_name),
+                    FOREIGN KEY(admin_id) REFERENCES admin(id)
+                   )''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS time_slots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin_id INTEGER,
+                    batch_id INTEGER,
                     start_time TEXT,
                     end_time TEXT,
                     FOREIGN KEY(admin_id) REFERENCES admin(id)
                    )''')
     conn.commit()
     conn.close()
+    update_schema()
 
-# Haar Cascade for face detection (used only for drawing boxes during capture)
-CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-
-# Global variable for camera control
-camera_running = False
-
-# ---------- Utility Functions ----------
 def get_admin_folder(username):
-    folder = os.path.join("data", f"admin_{username}")
-    os.makedirs(folder, exist_ok=True)
-    os.makedirs(os.path.join(folder, "users"), exist_ok=True)
-    os.makedirs(os.path.join(folder, "attendance"), exist_ok=True)
-    return folder
+    path = os.path.join('data', f'admin_{username}')
+    os.makedirs(path, exist_ok=True)
+    return path
 
-def load_known_faces(admin_folder):
-    """
-    Load all known face encodings from the admin's user folder.
-    Each user's folder should contain an 'encoding.npy' file.
-    Returns a dict: {user_id (int): {"name": str, "encoding": np.array}}
-    """
+def get_batch_folder(admin_folder, batch_id, batch_name):
+    path = os.path.join(admin_folder, f'batch_{batch_id}_{batch_name}')
+    os.makedirs(os.path.join(path, 'users'), exist_ok=True)
+    return path
+
+def load_known_faces(batch_folder):
     known = {}
-    user_folder = os.path.join(admin_folder, "users")
-    if not os.path.exists(user_folder):
+    user_dir = os.path.join(batch_folder, 'users')
+    if not os.path.isdir(user_dir):
         return known
-    for user_id in os.listdir(user_folder):
-        user_path = os.path.join(user_folder, user_id)
-        info_file = os.path.join(user_path, "info.txt")
-        encoding_file = os.path.join(user_path, "encoding.npy")
-        if os.path.exists(info_file) and os.path.exists(encoding_file):
-            with open(info_file, "r") as f:
-                name = f.read().strip()
-            try:
-                uid = int(user_id)
-            except ValueError:
-                continue
-            encoding = np.load(encoding_file)
-            known[uid] = {"name": name, "encoding": encoding}
+    for uid in os.listdir(user_dir):
+        try:
+            u = int(uid)
+        except:
+            continue
+        info_file = os.path.join(user_dir, uid, 'info.txt')
+        enc_file = os.path.join(user_dir, uid, 'encoding.npy')
+        if os.path.exists(info_file) and os.path.exists(enc_file):
+            name = open(info_file).read().strip()
+            encoding = np.load(enc_file)
+            known[u] = {'name': name, 'encoding': encoding}
     return known
 
 def save_face_encoding(user_folder, encoding):
-    """
-    Save the given face encoding as a NumPy file.
-    """
-    np.save(os.path.join(user_folder, "encoding.npy"), encoding)
+    np.save(os.path.join(user_folder, 'encoding.npy'), encoding)
 
-# ---------- Main Application Class ----------
-class FaceRecognitionApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Face Recognition Attendance System")
-        self.root.geometry("900x700")
-        self.style = ttk.Style(self.root)
-        self.style.theme_use("clam")
-        self.admin_info = None   # (id, name, username)
-        self.admin_folder = None
-        self.known_faces = {}    # {user_id: {"name": str, "encoding": np.array}}
-        self.attendance = {}     # {user_id: "Present" or "Absent"}
-        self.selected_time_slot = None
-        self.camera_image = None
-        self.cap = None          # VideoCapture object
-        self.frame_counter = 0   # For frame skipping in update_camera
-        self.last_detections = []  # Cache last detections (locations and encodings)
-        self.create_login_ui()
-
-    def clear_frame(self):
-        for widget in self.root.winfo_children():
-            widget.destroy()
-
-    # ------------- Login & Registration -------------
-    def create_login_ui(self):
-        self.clear_frame()
-        frm = ttk.Frame(self.root, padding=20)
-        frm.pack(expand=True)
-        ttk.Label(frm, text="Login", font=("Helvetica", 20)).grid(row=0, column=0, columnspan=2, pady=10)
-        ttk.Label(frm, text="Username:").grid(row=1, column=0, sticky="e", pady=5)
-        self.username_entry = ttk.Entry(frm, width=30)
-        self.username_entry.grid(row=1, column=1, pady=5)
-        ttk.Label(frm, text="Password:").grid(row=2, column=0, sticky="e", pady=5)
-        self.password_entry = ttk.Entry(frm, width=30, show="*")
-        self.password_entry.grid(row=2, column=1, pady=5)
-        ttk.Button(frm, text="Login", command=self.login).grid(row=3, column=0, columnspan=2, pady=10)
-        ttk.Button(frm, text="Register", command=self.register).grid(row=4, column=0, columnspan=2, pady=5)
-
-    def login(self):
-        username = self.username_entry.get()
-        password = self.password_entry.get()
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, username FROM admin WHERE username=? AND password=?", (username, password))
-        admin = cur.fetchone()
-        conn.close()
-        if admin:
-            self.admin_info = admin
-            messagebox.showinfo("Login Success", f"Welcome, {admin[1]}!")
-            self.admin_folder = get_admin_folder(admin[2])
-            self.known_faces = load_known_faces(self.admin_folder)
-            self.create_dashboard_ui()
-        else:
-            messagebox.showerror("Error", "Invalid credentials")
-
-    def register(self):
-        reg_win = tk.Toplevel(self.root)
-        reg_win.title("Admin Registration")
-        reg_win.geometry("300x200")
-        frm = ttk.Frame(reg_win, padding=10)
-        frm.pack(expand=True, fill="both")
-        ttk.Label(frm, text="Name:").grid(row=0, column=0, sticky="e", pady=5)
-        name_entry = ttk.Entry(frm, width=25)
-        name_entry.grid(row=0, column=1, pady=5)
-        ttk.Label(frm, text="Username:").grid(row=1, column=0, sticky="e", pady=5)
-        username_entry = ttk.Entry(frm, width=25)
-        username_entry.grid(row=1, column=1, pady=5)
-        ttk.Label(frm, text="Password:").grid(row=2, column=0, sticky="e", pady=5)
-        password_entry = ttk.Entry(frm, width=25, show="*")
-        password_entry.grid(row=2, column=1, pady=5)
-        def do_register():
-            name = name_entry.get()
-            username = username_entry.get()
-            password = password_entry.get()
-            if name and username and password:
-                conn = sqlite3.connect(DB_NAME)
-                cur = conn.cursor()
-                try:
-                    cur.execute("INSERT INTO admin (name, username, password) VALUES (?, ?, ?)", (name, username, password))
-                    conn.commit()
-                    messagebox.showinfo("Success", "Registration successful!")
-                    reg_win.destroy()
-                except sqlite3.IntegrityError:
-                    messagebox.showerror("Error", "Username already exists")
-                conn.close()
-            else:
-                messagebox.showerror("Error", "All fields required")
-        ttk.Button(frm, text="Register", command=do_register).grid(row=3, column=0, columnspan=2, pady=10)
-
-    # ------------- Dashboard & Attendance UI -------------
-    def create_dashboard_ui(self):
-        self.clear_frame()
-        header_frame = ttk.Frame(self.root, padding=10)
-        header_frame.pack(fill="x")
-        header = ttk.Label(header_frame, text=f"Welcome Admin: {self.admin_info[1]}", font=("Helvetica", 18))
-        header.pack(side="left", padx=10)
-        ttk.Button(header_frame, text="Logout", command=self.logout).pack(side="right", padx=10)
-        
-        # Top frame for control buttons
-        control_frame = ttk.Frame(self.root, padding=10)
-        control_frame.pack(fill="x")
-        ttk.Button(control_frame, text="Manage Time Slots", command=self.manage_time_slots).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(control_frame, text="Start Attendance", command=self.show_time_slot_dropdown).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(control_frame, text="Stop Attendance", command=self.stop_attendance).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(control_frame, text="Register User", command=self.register_user).grid(row=0, column=3, padx=5, pady=5)
-        ttk.Button(control_frame, text="View Users", command=self.view_users).grid(row=0, column=4, padx=5, pady=5)
-        ttk.Button(control_frame, text="Delete User", command=self.delete_user).grid(row=0, column=5, padx=5, pady=5)
-
-        # Main frame for camera feed and attendance table
-        main_frame = ttk.Frame(self.root, padding=10)
-        main_frame.pack(expand=True, fill="both")
-        # Left: Camera feed
-        cam_frame = ttk.LabelFrame(main_frame, text="Camera Feed", padding=10)
-        cam_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.camera_panel = ttk.Label(cam_frame)
-        self.camera_panel.pack(expand=True, fill="both")
-        # Right: Attendance table
-        table_frame = ttk.LabelFrame(main_frame, text="Attendance", padding=10)
-        table_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-        self.attendance_table = ttk.Treeview(table_frame, columns=("ID", "Name", "Status"), show="headings", height=15)
-        self.attendance_table.heading("ID", text="ID")
-        self.attendance_table.heading("Name", text="Name")
-        self.attendance_table.heading("Status", text="Attendance")
-        self.attendance_table.column("ID", width=50, anchor="center")
-        self.attendance_table.column("Name", width=150, anchor="center")
-        self.attendance_table.column("Status", width=100, anchor="center")
-        self.attendance_table.pack(expand=True, fill="both", side="left")
-        self.attendance_table.bind("<Double-1>", self.edit_attendance)
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.attendance_table.yview)
-        self.attendance_table.configure(yscroll=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Bottom frame for export button
-        export_frame = ttk.Frame(self.root, padding=10)
-        export_frame.pack(fill="x")
-        ttk.Button(export_frame, text="Export Attendance as CSV", command=self.export_attendance_csv).pack()
-
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(0, weight=1)
-
-    def logout(self):
-        self.stop_attendance()
+class FaceRecognitionApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        init_db()
         self.admin_info = None
-        self.admin_folder = None
+        self.batches = []
         self.known_faces = {}
         self.attendance = {}
-        self.create_login_ui()
+        self.selected_batch = None
+        self.selected_slot = None
+        self.admin_folder = None
+        self.batch_folder = None
+        self.cap = None
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
 
-    # ------------- Time Slot Management -------------
-    def manage_time_slots(self):
-        ts_win = tk.Toplevel(self.root)
-        ts_win.title("Time Slot Management")
-        ts_win.geometry("400x300")
-        frm = ttk.Frame(ts_win, padding=10)
-        frm.pack(expand=True, fill="both")
-        ttk.Label(frm, text="Time Slots", font=("Helvetica", 14)).grid(row=0, column=0, columnspan=3, pady=5)
-        listbox = tk.Listbox(frm, width=40, height=10)
-        listbox.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+        self.setWindowTitle('Edumark: Face Recognition Attendance')
+        self.setGeometry(200, 100, 1000, 700)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        app = QApplication.instance()
+        app.setStyleSheet(GLOBAL_STYLESHEET)
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        # Login
+        self.login_widget = QWidget()
+        self._build_login_ui()
+        self.stack.addWidget(self.login_widget)
+
+        # Dashboard + Tabs
+        self.dashboard_widget = QWidget()
+        self._build_dashboard_ui()
+        self.stack.addWidget(self.dashboard_widget)
+
+    def _build_login_ui(self):
+        layout = QVBoxLayout(self.login_widget)
+        layout.setAlignment(Qt.AlignCenter)
+        box = QGroupBox('Admin Login / Register')
+        form = QFormLayout(box)
+        self.username_input = QLineEdit()
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        form.addRow('Username:', self.username_input)
+        form.addRow('Password:', self.password_input)
+        btns = QHBoxLayout()
+        login_btn = QPushButton('Login')
+        reg_btn = QPushButton('Register')
+        login_btn.clicked.connect(self.login)
+        reg_btn.clicked.connect(self.register)
+        btns.addWidget(login_btn); btns.addWidget(reg_btn)
+        form.addRow(btns)
+        layout.addWidget(box)
+
+    def login(self):
+        uname = self.username_input.text().strip()
+        pwd = self.password_input.text().strip()
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
-        cur.execute("SELECT id, start_time, end_time FROM time_slots WHERE admin_id=?", (self.admin_info[0],))
-        slots = cur.fetchall()
+        cur.execute(
+            "SELECT id,name,username FROM admin WHERE username=? AND password=?",
+            (uname, pwd)
+        )
+        row = cur.fetchone()
         conn.close()
-        for s in slots:
-            listbox.insert(tk.END, f"{s[0]}: {s[1]} - {s[2]}")
-        def add_slot():
-            start = simpledialog.askstring("Input", "Enter start time (HH:MM)", parent=ts_win)
-            end = simpledialog.askstring("Input", "Enter end time (HH:MM)", parent=ts_win)
-            if start and end:
-                conn = sqlite3.connect(DB_NAME)
-                cur = conn.cursor()
-                cur.execute("INSERT INTO time_slots (admin_id, start_time, end_time) VALUES (?, ?, ?)",
-                            (self.admin_info[0], start, end))
-                conn.commit()
-                conn.close()
-                listbox.insert(tk.END, f"(new): {start} - {end}")
-        def delete_slot():
-            sel = listbox.curselection()
-            if sel:
-                slot_text = listbox.get(sel[0])
-                slot_id = slot_text.split(":")[0]
-                if messagebox.askyesno("Confirm", "Are you sure you want to delete this time slot?"):
+        if row:
+            self.admin_info = row
+            QMessageBox.information(self, 'Success', f'Welcome {row[1]}')
+            self.admin_folder = get_admin_folder(row[2])
+            self._refresh_batches()
+            self.stack.setCurrentWidget(self.dashboard_widget)
+        else:
+            QMessageBox.warning(self, 'Error', 'Invalid credentials')
+
+    def register(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Register Admin')
+        form = QFormLayout(dlg)
+        name_in = QLineEdit()
+        user_in = QLineEdit()
+        pwd_in = QLineEdit()
+        pwd_in.setEchoMode(QLineEdit.Password)
+        form.addRow('Name:', name_in)
+        form.addRow('Username:', user_in)
+        form.addRow('Password:', pwd_in)
+        btns = QHBoxLayout()
+        ok = QPushButton('OK'); cancel = QPushButton('Cancel')
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok); btns.addWidget(cancel)
+        form.addRow(btns)
+        if dlg.exec_() == QDialog.Accepted:
+            name, uname, pwd = name_in.text(), user_in.text(), pwd_in.text()
+            if name and uname and pwd:
+                try:
                     conn = sqlite3.connect(DB_NAME)
                     cur = conn.cursor()
-                    cur.execute("DELETE FROM time_slots WHERE id=?", (slot_id,))
+                    cur.execute(
+                        "INSERT INTO admin(name,username,password) VALUES(?,?,?)",
+                        (name, uname, pwd)
+                    )
                     conn.commit()
                     conn.close()
-                    listbox.delete(sel[0])
-        ttk.Button(frm, text="Add Time Slot", command=add_slot).grid(row=2, column=0, pady=5)
-        ttk.Button(frm, text="Delete Time Slot", command=delete_slot).grid(row=2, column=1, pady=5)
+                    QMessageBox.information(self, 'Success', 'Registered Successfully')
+                except sqlite3.IntegrityError:
+                    QMessageBox.warning(self, 'Error', 'Username already exists')
+            else:
+                QMessageBox.warning(self, 'Error', 'All fields required')
 
-    # ------------- Attendance Functions -------------
-    def show_time_slot_dropdown(self):
-        # Create a new window to select a time slot using a dropdown
-        ts_win = tk.Toplevel(self.root)
-        ts_win.title("Select Time Slot")
-        ts_win.geometry("300x150")
-        frm = ttk.Frame(ts_win, padding=10)
-        frm.pack(expand=True, fill="both")
-        ttk.Label(frm, text="Select Time Slot:", font=("Helvetica", 12)).pack(pady=10)
-        # Fetch time slots for current admin
+    def _build_dashboard_ui(self):
+        layout = QVBoxLayout(self.dashboard_widget)
+
+        # Top row: batch selector + add/delete + logout
+        top = QGroupBox()
+        hl = QHBoxLayout(top)
+        hl.addWidget(QLabel('Batch:'))
+        self.batch_combo = QComboBox()
+        hl.addWidget(self.batch_combo)
+        add_b = QPushButton('Add Batch'); del_b = QPushButton('Delete Batch')
+        for btn in (add_b, del_b):
+            btn.setStyleSheet("background-color:#88C0D0; color:#2E3440;")
+        hl.addWidget(add_b); hl.addWidget(del_b)
+        hl.addStretch()
+        logout_btn = QPushButton('Logout')
+        logout_btn.setStyleSheet("background-color:#88C0D0; color:#2E3440;")
+        hl.addWidget(logout_btn)
+
+        add_b.clicked.connect(self.add_batch)
+        del_b.clicked.connect(self.delete_batch)
+        logout_btn.clicked.connect(self.logout)
+        self.batch_combo.currentIndexChanged.connect(self.change_batch)
+
+        layout.addWidget(top)
+
+        # Tabs
+        self.inner_tabs = QTabWidget()
+        layout.addWidget(self.inner_tabs)
+
+        # Attendance tab
+        att_tab = QWidget()
+        att_tab.setStyleSheet("background-color: #434C5E;")
+        self._build_attendance_ui(att_tab)
+        self.inner_tabs.addTab(att_tab, 'Attendance')
+
+        # User Management
+        user_tab = QWidget()
+        user_tab.setStyleSheet("background-color: #3B4252;")
+        self._build_user_ui(user_tab)
+        self.inner_tabs.addTab(user_tab, 'User Management')
+
+        # Time Slots
+        slot_tab = QWidget()
+        slot_tab.setStyleSheet("background-color: #4C566A;")
+        self._build_timeslot_ui(slot_tab)
+        self.inner_tabs.addTab(slot_tab, 'Time Slots')
+
+    def _refresh_batches(self):
+        self.batch_combo.clear()
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
-        cur.execute("SELECT id, start_time, end_time FROM time_slots WHERE admin_id=?", (self.admin_info[0],))
+        cur.execute("SELECT id,batch_name FROM batch WHERE admin_id=?", (self.admin_info[0],))
+        self.batches = cur.fetchall()
+        conn.close()
+        for bid, name in self.batches:
+            self.batch_combo.addItem(name, bid)
+        if self.batches:
+            self.change_batch(0)
+
+    def add_batch(self):
+        text, ok = QInputDialog.getText(self, 'Add Batch', 'Batch Name:')
+        if ok and text:
+            try:
+                conn = sqlite3.connect(DB_NAME)
+                cur = conn.cursor()
+                cur.execute("INSERT INTO batch(admin_id,batch_name) VALUES(?,?)",
+                            (self.admin_info[0], text))
+                conn.commit()
+                conn.close()
+                self._refresh_batches()
+            except sqlite3.IntegrityError:
+                QMessageBox.warning(self, 'Error', 'Batch exists')
+
+    def delete_batch(self):
+        idx = self.batch_combo.currentIndex()
+        if idx < 0: return
+        bid = self.batch_combo.itemData(idx)
+        name = self.batch_combo.currentText()
+        if QMessageBox.question(self, 'Confirm', f'Delete batch {name}?') == QMessageBox.Yes:
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM batch WHERE id=?", (bid,))
+            conn.commit(); conn.close()
+            shutil.rmtree(get_batch_folder(self.admin_folder, bid, name), ignore_errors=True)
+            self._refresh_batches()
+
+    def change_batch(self, idx):
+        if idx < 0: return
+        bid, name = self.batches[idx]
+        self.selected_batch = (bid, name)
+        self.batch_folder = get_batch_folder(self.admin_folder, bid, name)
+        self.known_faces = load_known_faces(self.batch_folder)
+        self.attendance = {uid: 'Absent' for uid in self.known_faces}
+        self._refresh_attendance_table()
+        self._refresh_user_list()
+        self._refresh_timeslot_list()
+
+    # ---------- Attendance ----------
+    def _build_attendance_ui(self, parent):
+        layout = QVBoxLayout(parent)
+        ctrl = QHBoxLayout()
+        start_btn = QPushButton('Start Attendance')
+        stop_btn = QPushButton('Stop Attendance')
+        export_btn = QPushButton('Export CSV')
+        for btn in (start_btn, stop_btn, export_btn):
+            btn.setStyleSheet("background-color:#88C0D0; color:#2E3440;")
+        ctrl.addWidget(start_btn); ctrl.addWidget(stop_btn); ctrl.addWidget(export_btn)
+        layout.addLayout(ctrl)
+        start_btn.clicked.connect(self.select_and_start)
+        stop_btn.clicked.connect(self.stop_attendance)
+        export_btn.clicked.connect(self.export_csv)
+
+        content = QHBoxLayout()
+        self.video_label = QLabel(); self.video_label.setFixedSize(640, 480)
+        content.addWidget(self.video_label)
+        self.att_table = QTableWidget(0, 3)
+        self.att_table.setHorizontalHeaderLabels(['ID', 'Name', 'Status'])
+        self.att_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.att_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        content.addWidget(self.att_table)
+        layout.addLayout(content)
+
+    def select_and_start(self):
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, start_time || ' - ' || end_time FROM time_slots "
+            "WHERE admin_id=? AND batch_id=?",
+            (self.admin_info[0], self.selected_batch[0])
+        )
         slots = cur.fetchall()
         conn.close()
         if not slots:
-            messagebox.showerror("Error", "No time slots defined. Please add one first.")
-            ts_win.destroy()
-            return
-        # Create a dict for display and mapping to slot id
-        self.slot_options = {f"{s[1]} - {s[2]}": s[0] for s in slots}
-        slot_names = list(self.slot_options.keys())
-        self.slot_var = tk.StringVar(value=slot_names[0])
-        slot_dropdown = ttk.Combobox(frm, textvariable=self.slot_var, values=slot_names, state="readonly")
-        slot_dropdown.pack(pady=5)
-        def select_slot():
-            chosen = self.slot_var.get()
-            self.selected_time_slot = self.slot_options.get(chosen)
-            ts_win.destroy()
-            self.start_attendance_session()
-        ttk.Button(frm, text="Start", command=select_slot).pack(pady=10)
+            QMessageBox.warning(self, 'Error', 'No time slots defined'); return
+        items = [s[1] for s in slots]
+        sel, ok = QInputDialog.getItem(self, 'Select Time Slot', 'Time Slot:', items, 0, False)
+        if ok:
+            idx = items.index(sel)
+            self.selected_slot = slots[idx][0]
+            self.attendance = {uid: 'Absent' for uid in self.known_faces}
+            self._refresh_attendance_table()
+            self.cap = cv2.VideoCapture(0)
+            self.timer.start(30)
 
-    def start_attendance_session(self):
-        # Initialize attendance: mark all registered users as "Absent"
-        self.attendance = {uid: "Absent" for uid in self.known_faces.keys()}
-        self.refresh_attendance_table()
-        global camera_running
-        camera_running = True
-        self.cap = cv2.VideoCapture(0)
-        # Reset frame counter and detections cache
-        self.frame_counter = 0
-        self.last_detections = []
-        self.update_camera()
-
-    def update_camera(self):
-        if not camera_running or self.cap is None:
-            return
+    def update_frame(self):
         ret, frame = self.cap.read()
-        if ret:
-            # Mirror and reduce resolution to lessen processing load
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(frame, (640, 480))
-            self.frame_counter += 1
-            # Process every 3rd frame for face detection/recognition
-            if self.frame_counter % 3 == 0:
-                rgb_frame = frame[:, :, ::-1]  # Convert BGR to RGB for face_recognition
-                face_locations = face_recognition.face_locations(rgb_frame)
-                face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-                # Cache detections to use for drawing on every frame
-                self.last_detections = list(zip(face_locations, face_encodings))
-                # Update attendance based on detections
-                for (top, right, bottom, left), face_encoding in self.last_detections:
-                    for uid, data in self.known_faces.items():
-                        matches = face_recognition.compare_faces([data["encoding"]], face_encoding, tolerance=0.5)
-                        if matches[0]:
-                            self.attendance[uid] = "Present"
-                            break
-            # Draw the cached detections
-            for (top, right, bottom, left), face_encoding in self.last_detections:
-                name = "Unknown"
-                for uid, data in self.known_faces.items():
-                    matches = face_recognition.compare_faces([data["encoding"]], face_encoding, tolerance=0.5)
-                    if matches[0]:
-                        name = data["name"]
-                        break
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                cv2.putText(frame, name, (left, top - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
-            # Convert the frame to ImageTk format and update panel
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            self.camera_image = ImageTk.PhotoImage(image=img)
-            self.camera_panel.config(image=self.camera_image)
-            self.refresh_attendance_table()
-        self.root.after(30, self.update_camera)
+        if not ret: return
+        frame = cv2.flip(frame, 1)
+        rgb = frame[:, :, ::-1]
+        locs = face_recognition.face_locations(rgb)
+        encs = face_recognition.face_encodings(rgb, locs)
+        for loc, enc in zip(locs, encs):
+            name = 'Unknown'
+            for uid, data in self.known_faces.items():
+                if face_recognition.compare_faces([data['encoding']], enc, tolerance=0.5)[0]:
+                    name = data['name']
+                    self.attendance[uid] = 'Present'
+                    break
+            top, right, bottom, left = loc
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(frame, name, (left, top-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2)
+        h, w, _ = frame.shape
+        img = QImage(frame.data, w, h, 3*w, QImage.Format_BGR888)
+        self.video_label.setPixmap(QPixmap.fromImage(img))
+        self._refresh_attendance_table()
 
     def stop_attendance(self):
-        global camera_running
-        camera_running = False
-        if self.cap is not None:
+        if self.cap:
+            self.timer.stop()
             self.cap.release()
             self.cap = None
-        self.camera_panel.config(image='')
+            self.video_label.clear()
 
-    def refresh_attendance_table(self):
-        for row in self.attendance_table.get_children():
-            self.attendance_table.delete(row)
+    def _refresh_attendance_table(self):
+        self.att_table.setRowCount(0)
         for uid, status in self.attendance.items():
-            name = self.known_faces.get(uid, {}).get("name", "Unknown")
-            self.attendance_table.insert("", tk.END, values=(uid, name, status))
+            r = self.att_table.rowCount()
+            self.att_table.insertRow(r)
+            self.att_table.setItem(r, 0, QTableWidgetItem(str(uid)))
+            self.att_table.setItem(r, 1, QTableWidgetItem(self.known_faces[uid]['name']))
+            cb = QComboBox()
+            cb.addItems(['Present', 'Absent'])
+            cb.setCurrentText(status)
+            cb.currentTextChanged.connect(lambda s, uid=uid: self.attendance.__setitem__(uid, s))
+            self.att_table.setCellWidget(r, 2, cb)
 
-    def export_attendance_csv(self):
-        if not self.selected_time_slot:
-            messagebox.showerror("Error", "No attendance session in progress.")
-            return
-        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        file_path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                                 initialfile=f"attendance_{now}.csv",
-                                                 filetypes=[("CSV files", "*.csv")])
-        if not file_path:
-            return
-        try:
-            with open(file_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Date", "Time Slot", "User ID", "Name", "Attendance"])
-                for uid, status in self.attendance.items():
-                    writer.writerow([now, self.selected_time_slot, uid,
-                                     self.known_faces.get(uid, {}).get("name", "Unknown"), status])
-            messagebox.showinfo("Export Success", f"Attendance exported to {file_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not export CSV: {e}")
+    def export_csv(self):
+        if not self.selected_slot:
+            QMessageBox.warning(self, 'Error', 'No session in progress'); return
+        now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save CSV', f'attendance_{now}.csv', 'CSV Files (*.csv)'
+        )
+        if not path: return
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Date', 'Time Slot', 'User ID', 'Name', 'Status'])
+            for uid, status in self.attendance.items():
+                writer.writerow([
+                    now,
+                    self.selected_slot,
+                    uid,
+                    self.known_faces[uid]['name'],
+                    status
+                ])
+        QMessageBox.information(self, 'Export Success', f'Saved to {path}')
 
-    # ------------- User Registration -------------
+    # ---------- User Management ----------
+    def _build_user_ui(self, parent):
+        layout = QVBoxLayout(parent)
+        btns = QHBoxLayout()
+        add_btn = QPushButton('Register User')
+        del_btn = QPushButton('Delete User')
+        for btn in (add_btn, del_btn):
+            btn.setStyleSheet("background-color:#88C0D0; color:#2E3440;")
+        btns.addWidget(add_btn); btns.addWidget(del_btn)
+        layout.addLayout(btns)
+        self.user_list = QListWidget()
+        layout.addWidget(self.user_list)
+        add_btn.clicked.connect(self.register_user)
+        del_btn.clicked.connect(self.delete_user)
+
+    def _refresh_user_list(self):
+        self.user_list.clear()
+        for uid, data in self.known_faces.items():
+            item = QListWidgetItem(f"ID: {uid}, Name: {data['name']}")
+            self.user_list.addItem(item)
+
     def register_user(self):
         cap = cv2.VideoCapture(0)
-        face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-        already_registered = False
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            frame = cv2.flip(frame, 1)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-            for (x, y, w, h) in faces:
-                face_img = frame[y:y+h, x:x+w]
-                # Compute encoding for the detected face
-                rgb_face = face_img[:, :, ::-1]
-                encodings = face_recognition.face_encodings(rgb_face)
-                if encodings:
-                    face_encoding = encodings[0]
-                    # Check against known faces
-                    for uid, data in self.known_faces.items():
-                        matches = face_recognition.compare_faces([data["encoding"]], face_encoding, tolerance=0.5)
-                        if matches[0]:
-                            messagebox.showinfo("Info", "Face is already registered!")
-                            already_registered = True
-                            break
-            cv2.imshow("Register - Press 'q' to capture", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q') or already_registered:
-                break
+        cascade = cv2.CascadeClassifier(CASCADE_PATH)
+        ret, frame = cap.read()
         cap.release()
-        cv2.destroyAllWindows()
-        if already_registered:
-            return
-        user_name = simpledialog.askstring("Input", "Enter user name:")
-        user_id = simpledialog.askstring("Input", "Enter user ID (numeric):")
-        if not user_name or not user_id:
-            messagebox.showerror("Error", "Name and ID are required")
-            return
+        if not ret:
+            QMessageBox.warning(self, 'Error', 'Camera error'); return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(gray, 1.1, 5)
+        if not len(faces):
+            QMessageBox.warning(self, 'Error', 'No face detected'); return
+        x, y, w, h = faces[0]
+        rgb = frame[:, :, ::-1]
+        encs = face_recognition.face_encodings(rgb, [(y, x+w, y+h, x)])
+        if not encs:
+            QMessageBox.warning(self, 'Error', 'Encoding failed'); return
+        enc = encs[0]
+        name, ok1 = QInputDialog.getText(self, 'Name', 'Enter Name:')
+        uid_str, ok2 = QInputDialog.getText(self, 'ID', 'Enter numeric ID:')
+        if not(ok1 and ok2): return
         try:
-            user_id_int = int(user_id)
-        except ValueError:
-            messagebox.showerror("Error", "User ID must be numeric")
-            return
-        user_folder = os.path.join(self.admin_folder, "users", str(user_id_int))
-        if os.path.exists(user_folder):
-            messagebox.showerror("Error", "User ID already exists")
-            return
-        os.makedirs(user_folder)
-        with open(os.path.join(user_folder, "info.txt"), "w") as f:
-            f.write(user_name)
-        # Capture images for registration and compute face encoding from a clear sample
-        cap = cv2.VideoCapture(0)
-        captured_encoding = None
-        count = 0
-        messagebox.showinfo("Info", "Capturing images. Press 'q' when a clear face is visible.")
-        while count < 100:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            frame = cv2.flip(frame, 1)
-            rgb_frame = frame[:, :, ::-1]
-            face_locations = face_recognition.face_locations(rgb_frame)
-            if face_locations:
-                face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-                if face_encodings:
-                    captured_encoding = face_encodings[0]
-                    count += 1
-                    cv2.putText(frame, f"Captured {count}/100", (50,50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-            cv2.imshow("Capturing images", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        cap.release()
-        cv2.destroyAllWindows()
-        if captured_encoding is None:
-            messagebox.showerror("Error", "Could not capture face encoding")
-            return
-        # Save the captured face encoding for later use during recognition
-        save_face_encoding(user_folder, captured_encoding)
-        messagebox.showinfo("Info", "User registered. Training model...")
-        # Reload known faces
-        self.known_faces = load_known_faces(self.admin_folder)
-        self.attendance[user_id_int] = "Absent"
-        self.refresh_attendance_table()
-
-    # ------------- View & Delete Users -------------
-    def view_users(self):
-        view_win = tk.Toplevel(self.root)
-        view_win.title("Registered Users")
-        view_win.geometry("350x300")
-        frm = ttk.Frame(view_win, padding=10)
-        frm.pack(expand=True, fill="both")
-        listbox = tk.Listbox(frm, width=50)
-        listbox.pack(padx=10, pady=10, fill="both", expand=True)
-        user_folder = os.path.join(self.admin_folder, "users")
-        if os.path.exists(user_folder):
-            for user_id in os.listdir(user_folder):
-                user_path = os.path.join(user_folder, user_id)
-                info_file = os.path.join(user_path, "info.txt")
-                if os.path.exists(info_file):
-                    with open(info_file, "r") as f:
-                        name = f.read().strip()
-                    listbox.insert(tk.END, f"ID: {user_id}, Name: {name}")
+            uid = int(uid_str)
+        except:
+            QMessageBox.warning(self, 'Error', 'ID must be numeric'); return
+        user_dir = os.path.join(self.batch_folder, 'users', str(uid))
+        if os.path.exists(user_dir):
+            QMessageBox.warning(self, 'Error', 'User exists'); return
+        os.makedirs(user_dir)
+        with open(os.path.join(user_dir, 'info.txt'), 'w') as f:
+            f.write(name)
+        save_face_encoding(user_dir, enc)
+        self.known_faces = load_known_faces(self.batch_folder)
+        self.attendance[uid] = 'Absent'
+        self._refresh_user_list()
 
     def delete_user(self):
-        user_id = simpledialog.askstring("Delete User", "Enter User ID to delete:")
-        if not user_id:
-            return
-        if messagebox.askyesno("Confirm", f"Are you sure you want to delete user {user_id}?"):
-            user_folder = os.path.join(self.admin_folder, "users", user_id)
-            if os.path.exists(user_folder):
-                shutil.rmtree(user_folder)
-                messagebox.showinfo("Info", f"User {user_id} deleted.")
-                self.known_faces = load_known_faces(self.admin_folder)
-                try:
-                    uid_int = int(user_id)
-                    if uid_int in self.attendance:
-                        del self.attendance[uid_int]
-                except ValueError:
-                    pass
-                self.refresh_attendance_table()
-            else:
-                messagebox.showerror("Error", "User not found.")
+        item = self.user_list.currentItem()
+        if not item: return
+        uid = int(item.text().split(',')[0].split(':')[1].strip())
+        if QMessageBox.question(self, 'Confirm', f'Delete user {uid}?') == QMessageBox.Yes:
+            path = os.path.join(self.batch_folder, 'users', str(uid))
+            shutil.rmtree(path, ignore_errors=True)
+            self.known_faces.pop(uid, None)
+            self.attendance.pop(uid, None)
+            self._refresh_user_list()
 
-    # ------------- Manual Edit of Attendance (with dropdown) -------------
-    def edit_attendance(self, event):
-        selected_item = self.attendance_table.focus()
-        if not selected_item:
-            return
-        values = self.attendance_table.item(selected_item, "values")
-        try:
-            user_id = int(values[0])
-        except ValueError:
-            return
-        current_status = values[2]
-        
-        # Popup window with a dropdown for attendance status
-        edit_win = tk.Toplevel(self.root)
-        edit_win.title("Edit Attendance")
-        edit_win.geometry("300x150")
-        frm = ttk.Frame(edit_win, padding=10)
-        frm.pack(expand=True, fill="both")
-        ttk.Label(frm, text=f"User {values[1]}:", font=("Helvetica", 12)).pack(pady=10)
-        status_var = tk.StringVar(value=current_status)
-        status_dropdown = ttk.Combobox(frm, textvariable=status_var, values=["Present", "Absent"], state="readonly")
-        status_dropdown.pack(pady=5)
-        def update_status():
-            new_status = status_var.get()
-            self.attendance[user_id] = new_status
-            self.refresh_attendance_table()
-            edit_win.destroy()
-        ttk.Button(frm, text="Update", command=update_status).pack(pady=10)
+    # ---------- Time Slot Management ----------
+    def _build_timeslot_ui(self, parent):
+        layout = QVBoxLayout(parent)
+        btns = QHBoxLayout()
+        add_btn = QPushButton('Add Time Slot')
+        del_btn = QPushButton('Delete Time Slot')
+        for btn in (add_btn, del_btn):
+            btn.setStyleSheet("background-color:#88C0D0; color:#2E3440;")
+        btns.addWidget(add_btn); btns.addWidget(del_btn)
+        layout.addLayout(btns)
+        self.slot_list = QListWidget()
+        layout.addWidget(self.slot_list)
+        add_btn.clicked.connect(self.add_timeslot)
+        del_btn.clicked.connect(self.delete_timeslot)
 
-# ------------- Main -------------
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = FaceRecognitionApp(root)
-    root.mainloop()
+    def _refresh_timeslot_list(self):
+        self.slot_list.clear()
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, start_time || ' - ' || end_time FROM time_slots "
+            "WHERE admin_id=? AND batch_id=?",
+            (self.admin_info[0], self.selected_batch[0])
+        )
+        for sid, label in cur.fetchall():
+            self.slot_list.addItem(f"{sid}: {label}")
+        conn.close()
+
+    def add_timeslot(self):
+        start, ok1 = QInputDialog.getText(self, 'Start Time', 'Enter HH:MM')
+        end, ok2 = QInputDialog.getText(self, 'End Time', 'Enter HH:MM')
+        if not(ok1 and ok2): return
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO time_slots(admin_id,batch_id,start_time,end_time) VALUES(?,?,?,?)",
+            (self.admin_info[0], self.selected_batch[0], start, end)
+        )
+        conn.commit(); conn.close()
+        self._refresh_timeslot_list()
+
+    def delete_timeslot(self):
+        item = self.slot_list.currentItem()
+        if not item: return
+        sid = int(item.text().split(':')[0])
+        if QMessageBox.question(self, 'Confirm', f'Delete time slot {sid}?') == QMessageBox.Yes:
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM time_slots WHERE id=?", (sid,))
+            conn.commit(); conn.close()
+            self._refresh_timeslot_list()
+
+    def logout(self):
+        self.stop_attendance()
+        self.stack.setCurrentWidget(self.login_widget)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    win = FaceRecognitionApp()
+    win.show()
+    sys.exit(app.exec_())
+
+
+# In[ ]:
